@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
         started_at: Utc::now(),
     };
 
+    api::reconcile_accounts(&state).await?;
+
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     println!("quark-server listening on http://{listen}/");

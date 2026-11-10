@@ -153,6 +153,15 @@ impl Db {
         Ok(())
     }
 
+    pub async fn reassign_downloads(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().await;
+        connection.execute(
+            "UPDATE downloads SET account_id = ?2 WHERE account_id = ?1",
+            params![from, to],
+        )?;
+        Ok(())
+    }
+
     pub async fn delete_account(&self, id: &str) -> anyhow::Result<()> {
         let connection = self.connection.lock().await;
         connection.execute("DELETE FROM downloads WHERE account_id = ?1", params![id])?;

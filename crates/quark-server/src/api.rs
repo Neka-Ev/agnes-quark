@@ -544,6 +544,31 @@ async fn persist_authorized(
     display_name: Option<String>,
 ) -> Result<AccountView, ApiError> {
     account.validate()?;
+    let (new_official, new_cookie) = quark_core::credential_capabilities(credential.as_str());
+    // A QR/Cookie login and an official authorization for the same Quark user
+    // otherwise show up as two sidebar entries. Keep one account that carries
+    // both credentials so browsing and folder download work from either path.
+    if new_official != new_cookie {
+        if let Some(target) = credential_merge_target(state, new_official).await? {
+            let existing = state.vault.decrypt(&target.credential)?;
+            let merged = if new_cookie {
+                quark_core::merge_legacy_cookie(&existing, credential.as_str())?
+            } else {
+                quark_core::merge_official_credential(&existing, credential.as_str())?
+            };
+            let cipher = state.vault.encrypt(&merged)?;
+            state.db.update_credential(&target.id, &cipher).await?;
+            state.factory.invalidate_account(&target.id);
+            state.legacy_factory.invalidate_account(&target.id);
+            let record = state
+                .db
+                .get_account(&target.id)
+                .await?
+                .ok_or_else(|| ApiError::not_found("账户不存在"))?;
+            return Ok(account_view(state, &record));
+        }
+    }
+
     let cipher = state.vault.encrypt(credential.as_str())?;
     let existing = state.db.get_account(&account.id).await?;
     let created_at = existing
@@ -566,6 +591,62 @@ async fn persist_authorized(
     state.db.upsert_account(&record).await?;
     state.factory.invalidate_account(&record.id);
     Ok(account_view(state, &record))
+}
+
+async fn credential_merge_target(
+    state: &AppState,
+    new_official: bool,
+) -> Result<Option<AccountRecord>, ApiError> {
+    let mut candidates = Vec::new();
+    for record in state.db.list_accounts().await? {
+        let Ok(credential) = state.vault.decrypt(&record.credential) else {
+            continue;
+        };
+        let (official, cookie) = quark_core::credential_capabilities(&credential);
+        if (new_official && cookie) || (!new_official && official) {
+            candidates.push(record);
+        }
+    }
+    Ok((candidates.len() == 1).then(|| candidates.remove(0)))
+}
+
+/// Collapse the historical "official account + standalone Cookie account" pair
+/// into one account. This runs once at startup so existing installations do not
+/// need to log in again after upgrading.
+pub(crate) async fn reconcile_accounts(state: &AppState) -> anyhow::Result<()> {
+    let mut official_only = Vec::new();
+    let mut cookie_only = Vec::new();
+    for record in state.db.list_accounts().await? {
+        let Ok(credential) = state.vault.decrypt(&record.credential) else {
+            continue;
+        };
+        match quark_core::credential_capabilities(&credential) {
+            (true, false) => official_only.push((record, credential)),
+            (false, true) => cookie_only.push((record, credential)),
+            _ => {}
+        }
+    }
+    if official_only.len() != 1 || cookie_only.len() != 1 {
+        return Ok(());
+    }
+
+    let (target, target_credential) = official_only.remove(0);
+    let (source, source_credential) = cookie_only.remove(0);
+    let merged = quark_core::merge_legacy_cookie(&target_credential, &source_credential)?;
+    let cipher = state.vault.encrypt(&merged)?;
+    state.db.update_credential(&target.id, &cipher).await?;
+    state.db.reassign_downloads(&source.id, &target.id).await?;
+    state.db.delete_account(&source.id).await?;
+    state.factory.invalidate_account(&target.id);
+    state.factory.invalidate_account(&source.id);
+    state.legacy_factory.invalidate_account(&target.id);
+    state.legacy_factory.invalidate_account(&source.id);
+    tracing::info!(
+        target = %target.id,
+        source = %source.id,
+        "merged standalone Quark Cookie account into official account"
+    );
+    Ok(())
 }
 
 fn account_view(state: &AppState, record: &AccountRecord) -> AccountView {

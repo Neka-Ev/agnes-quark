@@ -1592,10 +1592,18 @@ fn remote_file(value: &Value, parent_id: Option<&str>) -> ProviderResult<RemoteF
     let name =
         string_value(value, &["file_name", "filename", "name"]).unwrap_or_else(|| id.clone());
     let folder = bool_value(value, &["dir", "is_dir", "is_folder"]).unwrap_or_else(|| {
-        matches!(
-            string_value(value, &["file_type"]).as_deref(),
-            Some("0" | "folder")
-        )
+        let has_file_metadata = number_value(value, &["size", "file_size"])
+            .is_some_and(|size| size > 0)
+            || string_value(value, &["format_type", "mime_type"])
+                .is_some_and(|media_type| !media_type.is_empty());
+        if has_file_metadata {
+            false
+        } else {
+            matches!(
+                string_value(value, &["file_type"]).as_deref(),
+                Some("0" | "folder")
+            )
+        }
     });
     Ok(RemoteFileItem {
         id,
@@ -1915,6 +1923,20 @@ mod tests {
         .unwrap();
         assert_eq!(folder.kind, RemoteFileKind::Folder);
         assert!(!folder.downloadable);
+
+        let file = remote_file(
+            &json!({
+                "fid": "file",
+                "file_name": "notes.md",
+                "file_type": 0,
+                "size": 128,
+                "format_type": "text/markdown"
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(file.kind, RemoteFileKind::File);
+        assert!(file.downloadable);
     }
 
     #[test]

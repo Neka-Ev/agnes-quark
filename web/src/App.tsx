@@ -36,6 +36,28 @@ function messageOf(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
 }
 
+function timestampMillis(value: string | null): number {
+  if (!value) return 0;
+  const trimmed = value.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    // Quark returns milliseconds today, but accept seconds as well.
+    return trimmed.split(".")[0].length <= 10 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(trimmed);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function sortFileItems(items: FileItem[]): FileItem[] {
+  return [...items].sort((left, right) => {
+    const leftFolder = left.kind === "folder";
+    const rightFolder = right.kind === "folder";
+    if (leftFolder !== rightFolder) return leftFolder ? -1 : 1;
+    const delta = timestampMillis(right.modified_at) - timestampMillis(left.modified_at);
+    return delta !== 0 ? delta : left.name.localeCompare(right.name, "zh-CN");
+  });
+}
+
 function isUnauthorized(value: unknown): boolean {
   return value instanceof ApiError && value.code === "unauthorized";
 }
@@ -177,7 +199,7 @@ export default function App() {
     request
       .then((page) => {
         if (cancelled) return;
-        setFiles(page.items);
+        setFiles(sortFileItems(page.items));
         setNextToken(page.next_page_token);
       })
       .catch((value) => {
@@ -353,7 +375,7 @@ export default function App() {
       const page = searchQuery
         ? await api.search(activeId, searchQuery, nextToken)
         : await api.listFiles(activeId, parentId, nextToken);
-      setFiles((current) => [...current, ...page.items]);
+      setFiles((current) => sortFileItems([...current, ...page.items]));
       setNextToken(page.next_page_token);
     } catch (value) {
       handleError(value);
@@ -1031,8 +1053,7 @@ function formatBytes(value: number | null | undefined): string {
 }
 
 function formatDate(value: string | null): string {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
+  const millis = timestampMillis(value);
+  if (!millis) return "";
+  return new Date(millis).toLocaleString();
 }

@@ -450,15 +450,21 @@ impl FileSourceProvider for QuarkDriveSession {
 
     async fn get_file(&self, file_id: &str) -> ProviderResult<RemoteFileItem> {
         validate_id(file_id, "文件 ID")?;
+        // `GET /file?fids=...` ignores `fids` and returns the root listing, which
+        // used to make every file look like a folder. The detail endpoint takes a
+        // single `fid` and returns the item object directly.
         let response = self
             .api(
                 Method::GET,
-                "file",
-                vec![("fids".into(), file_id.into())],
+                "file/info",
+                vec![("fid".into(), file_id.into())],
                 None,
             )
             .await?;
         let data = response.get("data").unwrap_or(&Value::Null);
+        if data.as_object().is_some() {
+            return remote_file_item(data, None);
+        }
         let list = data
             .get("list")
             .and_then(Value::as_array)
@@ -467,7 +473,6 @@ impl FileSourceProvider for QuarkDriveSession {
         let value = list
             .iter()
             .find(|value| value_string(value, &["fid", "id"]).as_deref() == Some(file_id))
-            .or_else(|| list.first())
             .ok_or_else(|| {
                 ProviderError::new(ProviderErrorCategory::NotFound, "夸克网盘文件不存在")
             })?;
