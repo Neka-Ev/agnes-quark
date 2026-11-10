@@ -175,6 +175,7 @@ GET    /api/downloads/events                # SSE，事件名 downloads
 ## 安全说明
 
 - 凭证不以明文落盘：SQLite 只保存密文，密钥在 `data/master.key`，首次启动生成，权限 0600。
+- **请备份 `data/master.key`**；丢失后已保存的 Cookie/官方凭证无法解密，需要重新登录。
 - API 响应与日志不会返回 Cookie 或官方 token。
 - 默认仅回环监听；公网部署请使用反向代理 + TLS + 强令牌。
 - 建议通过 SSH 隧道访问，而不是直接把端口暴露到公网。

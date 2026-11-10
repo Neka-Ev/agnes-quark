@@ -129,11 +129,13 @@ impl DownloadEngine {
         let Some(row) = self.inner.db.get_download(id).await? else {
             return Ok(false);
         };
-        if let Ok(mut flags) = self.inner.cancellations.lock() {
-            flags
-                .entry(id.to_owned())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .store(true, Ordering::SeqCst);
+        if matches!(row.status.as_str(), "queued" | "running") {
+            if let Ok(mut flags) = self.inner.cancellations.lock() {
+                flags
+                    .entry(id.to_owned())
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .store(true, Ordering::SeqCst);
+            }
         }
         if row.status == "queued" {
             self.inner
@@ -812,6 +814,7 @@ mod tests {
         assert_eq!(safe_local_name("a/b\\c", "x"), "a_b_c");
         assert_eq!(safe_local_name("  ..  ", "x"), "x");
         assert_eq!(safe_local_name("\u{7}report\u{7}.pdf", "x"), "_report_.pdf");
+        assert_eq!(safe_local_name(".env", "x"), ".env");
     }
 
     struct FakeSource {
