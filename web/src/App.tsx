@@ -32,6 +32,21 @@ interface PathEntry {
 
 const ROOT: PathEntry = { id: null, name: "我的网盘" };
 
+function messageOf(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
+}
+
+function isUnauthorized(value: unknown): boolean {
+  return value instanceof ApiError && value.code === "unauthorized";
+}
+
+function isChallengeExpired(value: unknown): boolean {
+  return (
+    value instanceof ApiError &&
+    (value.code === "challenge_expired" || value.status === 410)
+  );
+}
+
 export default function App() {
   const [config, setConfig] = useState<ServerConfig | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -54,6 +69,8 @@ export default function App() {
     data: Challenge;
   } | null>(null);
   const [qrImage, setQrImage] = useState("");
+  const [challengeStatus, setChallengeStatus] = useState("");
+  const [challengeError, setChallengeError] = useState("");
   const [cookieText, setCookieText] = useState("");
   const [officialCode, setOfficialCode] = useState("");
   const [tokenInput, setTokenInput] = useState(getToken());
@@ -84,11 +101,11 @@ export default function App() {
   }
 
   function handleError(value: unknown) {
-    if (value instanceof ApiError && value.status === 401) {
+    if (isUnauthorized(value)) {
       setNeedsToken(true);
       return;
     }
-    setError(value instanceof Error ? value.message : String(value));
+    setError(messageOf(value));
   }
 
   async function refreshAccounts() {
@@ -213,29 +230,80 @@ export default function App() {
 
   useEffect(() => {
     if (!challenge) return;
+    const activeChallenge = challenge;
     let stopped = false;
-    const timer = window.setInterval(async () => {
+    let timer: number | undefined;
+    let inFlight = false;
+
+    function schedule(delay: number) {
+      if (!stopped) timer = window.setTimeout(tick, delay);
+    }
+
+    async function refreshQrCode() {
+      setChallengeError("");
+      setChallengeStatus("二维码已过期，正在重新获取…");
       try {
-        const result = await api.pollChallenge(challenge.data.challenge_id);
+        const data = await api.beginChallenge("qr");
+        if (stopped) return;
+        setChallenge({ kind: "qr", data });
+        setChallengeStatus("等待扫码确认中…");
+      } catch (value) {
+        if (stopped) return;
+        setChallengeStatus("");
+        setChallengeError(`重新获取二维码失败：${messageOf(value)}`);
+        schedule(3_000);
+      }
+    }
+
+    async function tick() {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const result = await api.pollChallenge(activeChallenge.data.challenge_id);
         if (stopped) return;
         if (result.status === "authorized") {
-          window.clearInterval(timer);
           setChallenge(null);
+          setChallengeStatus("");
+          setChallengeError("");
           setModal(null);
           setNotice("登录成功，账户已保存");
           await refreshAccounts();
           await refreshDownloads();
+          return;
         }
+        setChallengeError("");
+        setChallengeStatus(
+          activeChallenge.kind === "qr" ? "等待扫码确认中…" : "等待浏览器确认中…",
+        );
+        schedule(1_500);
       } catch (value) {
         if (stopped) return;
-        window.clearInterval(timer);
-        setChallenge(null);
-        handleError(value);
+        if (isUnauthorized(value)) {
+          setNeedsToken(true);
+          setModal({ type: "token" });
+          return;
+        }
+        if (activeChallenge.kind === "qr" && isChallengeExpired(value)) {
+          await refreshQrCode();
+          return;
+        }
+        if (activeChallenge.kind === "official" && isChallengeExpired(value)) {
+          setChallengeStatus("");
+          setChallengeError("授权已过期，请重新发起官方授权");
+          return;
+        }
+        // Keep polling after transient failures instead of silently stopping.
+        setChallengeError(messageOf(value));
+        schedule(3_000);
+      } finally {
+        inFlight = false;
       }
-    }, 2_000);
+    }
+
+    schedule(1_200);
     return () => {
       stopped = true;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [challenge]);
@@ -338,30 +406,48 @@ export default function App() {
 
   async function startQrLogin() {
     setError("");
+    setChallengeError("");
+    setChallengeStatus("正在获取二维码…");
+    setChallenge(null);
     setModal({ type: "qr" });
     setQrImage("");
     try {
       const data = await api.beginChallenge("qr");
       setChallenge({ kind: "qr", data });
+      setChallengeStatus("等待扫码确认中…");
     } catch (value) {
-      setModal(null);
-      handleError(value);
+      if (isUnauthorized(value)) {
+        setNeedsToken(true);
+        setModal({ type: "token" });
+        return;
+      }
+      setChallengeStatus("");
+      setChallengeError(`获取二维码失败：${messageOf(value)}`);
     }
   }
 
   async function startOfficialLogin() {
     setError("");
+    setChallengeError("");
+    setChallengeStatus("");
+    setChallenge(null);
     setModal({ type: "official" });
     setOfficialCode("");
     try {
       const data = await api.beginChallenge("official");
       setChallenge({ kind: "official", data });
+      setChallengeStatus("等待浏览器确认中…");
       if (data.payload.authorize_url) {
         window.open(data.payload.authorize_url, "_blank", "noopener,noreferrer");
       }
     } catch (value) {
-      setModal(null);
-      handleError(value);
+      if (isUnauthorized(value)) {
+        setNeedsToken(true);
+        setModal({ type: "token" });
+        return;
+      }
+      setChallengeStatus("");
+      setChallengeError(`发起官方授权失败：${messageOf(value)}`);
     }
   }
 
@@ -425,6 +511,8 @@ export default function App() {
   function closeModal() {
     setModal(null);
     setChallenge(null);
+    setChallengeStatus("");
+    setChallengeError("");
     setCookieText("");
     setOfficialCode("");
   }
@@ -720,9 +808,11 @@ export default function App() {
               <>
                 <h3>{modal.accountId ? "补充 Cookie" : "Cookie 登录"}</h3>
                 <p className="muted small">
-                  在浏览器登录 pan.quark.cn 后，从开发者工具复制请求中的 Cookie。至少需要
-                  __kps 和 __uid。官方授权账户补充 Cookie 后才能浏览目录。
+                  在浏览器登录 pan.quark.cn 后，从开发者工具复制任意请求的完整 Cookie
+                  （通常是 __pus、__kp、__kps、__puus、__uid 等字段），可直接粘贴整行
+                  “Cookie: …”或多行 name=value。官方授权账户补充 Cookie 后才能浏览目录。
                 </p>
+                {error && <p className="form-error">{error}</p>}
                 <form onSubmit={submitCookie}>
                   <textarea
                     value={cookieText}
@@ -762,8 +852,10 @@ export default function App() {
                   </p>
                 )}
                 <p className="muted small">
-                  {challenge?.kind === "official" ? "等待扫码/确认中…" : "授权已完成"}
+                  {challengeStatus || "授权已完成"}
                 </p>
+                {challengeError && <p className="form-error">{challengeError}</p>}
+                {error && <p className="form-error">{error}</p>}
                 <form onSubmit={submitOfficialCode}>
                   <label className="field-label">或粘贴官方授权码</label>
                   <input
@@ -788,9 +880,16 @@ export default function App() {
                 <h3>扫码登录夸克网盘</h3>
                 <p className="muted small">用夸克 App 扫描二维码，登录后会自动保存 Cookie。</p>
                 <div className="qr-box">
-                  {qrImage ? <img src={qrImage} alt="夸克登录二维码" /> : <div className="empty">正在获取二维码…</div>}
+                  {qrImage ? (
+                    <img src={qrImage} alt="夸克登录二维码" />
+                  ) : (
+                    <div className="empty">
+                      {challengeError ? "二维码获取失败" : "正在获取二维码…"}
+                    </div>
+                  )}
                 </div>
-                <p className="muted small">等待扫码确认中…</p>
+                <p className="muted small">{challengeStatus || "正在获取二维码…"}</p>
+                {challengeError && <p className="form-error">{challengeError}</p>}
                 <div className="modal-actions">
                   <button className="btn ghost" type="button" onClick={closeModal}>
                     取消

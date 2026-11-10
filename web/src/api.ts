@@ -33,9 +33,6 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set("content-type", "application/json");
   }
   const response = await fetch(path, { ...init, headers });
-  if (response.status === 401) {
-    window.dispatchEvent(new Event("quark:unauthorized"));
-  }
   if (!response.ok) {
     let message = `请求失败 (${response.status})`;
     let code = "http_error";
@@ -45,6 +42,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       code = body.error?.code ?? code;
     } catch {
       // Ignore non-JSON error bodies.
+    }
+    // Only the server access-token middleware uses the `unauthorized` code.
+    // Provider authentication failures (bad/expired Quark Cookie) must not
+    // open the access-token dialog.
+    if (response.status === 401 && code === "unauthorized") {
+      window.dispatchEvent(new Event("quark:unauthorized"));
     }
     throw new ApiError(response.status, code, message);
   }

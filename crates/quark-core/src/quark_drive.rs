@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +45,7 @@ pub struct QuarkDriveFactory {
     client: reqwest::Client,
     sessions: StdMutex<HashMap<String, Weak<QuarkDriveSession>>>,
     qr_challenges: StdMutex<HashMap<String, QuarkQrChallenge>>,
+    active_qr_polls: StdMutex<HashSet<String>>,
 }
 
 impl QuarkDriveFactory {
@@ -59,6 +60,7 @@ impl QuarkDriveFactory {
             client,
             sessions: StdMutex::new(HashMap::new()),
             qr_challenges: StdMutex::new(HashMap::new()),
+            active_qr_polls: StdMutex::new(HashSet::new()),
         })
     }
 }
@@ -133,6 +135,10 @@ impl ProviderFactory for QuarkDriveFactory {
             .await
             .map_err(network_error)?;
         let status = response.status();
+        // The login endpoint binds the QR token to a short-lived browser
+        // session. Those cookies must be replayed when polling the token,
+        // otherwise Quark answers "Token Not Found" even after a scan.
+        let session_cookie = cookie_string_from_headers(response.headers()).unwrap_or_default();
         let value: Value = response
             .json()
             .await
@@ -173,6 +179,7 @@ impl ProviderFactory for QuarkDriveFactory {
                 challenge_id.clone(),
                 QuarkQrChallenge {
                     token: token.to_string(),
+                    session_cookie,
                     expires_at,
                 },
             );
@@ -189,6 +196,23 @@ impl ProviderFactory for QuarkDriveFactory {
         &self,
         challenge_id: &str,
     ) -> ProviderResult<ProviderAuthorizationStep> {
+        // Polling may come from several browser tabs. Only let one request
+        // consume the one-time service ticket at a time.
+        let _poll_lease = {
+            let mut active = self.active_qr_polls.lock().map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorCategory::RemoteUnavailable,
+                    "夸克二维码会话注册表不可用",
+                )
+            })?;
+            if !active.insert(challenge_id.to_owned()) {
+                return Ok(ProviderAuthorizationStep::Pending);
+            }
+            QrPollLease {
+                active: &self.active_qr_polls,
+                challenge_id: challenge_id.to_owned(),
+            }
+        };
         let challenge = {
             let challenges = self.qr_challenges.lock().map_err(|_| {
                 ProviderError::new(
@@ -223,11 +247,26 @@ impl ProviderFactory for QuarkDriveFactory {
         let response = self
             .client
             .get(status_url)
-            .headers(public_headers()?)
+            .headers(qr_session_headers(&challenge.session_cookie)?)
             .send()
             .await
             .map_err(network_error)?;
         let http_status = response.status();
+        // Quark rotates the QR session cookie on every poll. Merge it back so
+        // later polls and the final ticket exchange keep working.
+        let session_cookie = match cookie_string_from_headers(response.headers()) {
+            Some(updated) => {
+                let merged =
+                    merge_cookie_strings(&challenge.session_cookie, &updated).unwrap_or(updated);
+                if let Ok(mut challenges) = self.qr_challenges.lock() {
+                    if let Some(stored) = challenges.get_mut(challenge_id) {
+                        stored.session_cookie = merged.clone();
+                    }
+                }
+                merged
+            }
+            None => challenge.session_cookie.clone(),
+        };
         let value: Value = response
             .json()
             .await
@@ -249,12 +288,14 @@ impl ProviderFactory for QuarkDriveFactory {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| invalid_response("夸克二维码响应缺少 service_ticket"))?;
-            let cookie = exchange_service_ticket(&self.client, ticket).await?;
-            let authorized = authorized_from_cookie(&self.client, &cookie).await?;
+            // The service ticket is single-use. Drop the challenge before the
+            // exchange so a retry cannot consume it twice.
             self.qr_challenges
                 .lock()
                 .map_err(|_| invalid_response("夸克二维码会话注册表不可用"))?
                 .remove(challenge_id);
+            let cookie = exchange_service_ticket(&self.client, ticket, &session_cookie).await?;
+            let authorized = authorized_from_cookie(&self.client, &cookie).await?;
             return Ok(ProviderAuthorizationStep::Authorized(authorized));
         }
         if matches!(status_code, Some(50004002 | 50004003 | 50004004))
@@ -322,7 +363,21 @@ struct QuarkDriveSession {
 #[derive(Clone)]
 struct QuarkQrChallenge {
     token: String,
+    session_cookie: String,
     expires_at: Instant,
+}
+
+struct QrPollLease<'a> {
+    active: &'a StdMutex<HashSet<String>>,
+    challenge_id: String,
+}
+
+impl Drop for QrPollLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.challenge_id);
+        }
+    }
 }
 
 #[async_trait]
@@ -1360,10 +1415,22 @@ fn public_headers_with_user_agent(user_agent: &str) -> ProviderResult<HeaderMap>
     Ok(headers)
 }
 
-async fn exchange_service_ticket(client: &reqwest::Client, ticket: &str) -> ProviderResult<String> {
+fn qr_session_headers(session_cookie: &str) -> ProviderResult<HeaderMap> {
+    let mut headers = public_headers()?;
+    if !session_cookie.is_empty() {
+        headers.insert("cookie", header_value(session_cookie)?);
+    }
+    Ok(headers)
+}
+
+async fn exchange_service_ticket(
+    client: &reqwest::Client,
+    ticket: &str,
+    session_cookie: &str,
+) -> ProviderResult<String> {
     let response = client
         .get("https://pan.quark.cn/account/info")
-        .headers(public_headers()?)
+        .headers(qr_session_headers(session_cookie)?)
         .query(&[("st", ticket), ("lw", "scan")])
         .send()
         .await
@@ -2125,10 +2192,26 @@ fn status_error(status: StatusCode, message: &str) -> ProviderError {
 }
 
 fn status_error_with_message(status: StatusCode, value: &Value) -> ProviderError {
+    let upstream_message = value_string(value, &["message", "msg", "error_msg"])
+        .or_else(|| value_string(value, &["error", "message"]));
+    let upstream_code = value_string(value, &["code", "error_code", "errno"]);
+    let detail = match (upstream_code, upstream_message) {
+        (Some(code), Some(message)) => Some(format!("code={code}, message={message}")),
+        (Some(code), None) => Some(format!("code={code}")),
+        (None, Some(message)) => Some(format!("message={message}")),
+        (None, None) => None,
+    };
+    let detail = detail
+        .map(|detail| format!(", {detail}"))
+        .unwrap_or_default();
+
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         ProviderError::new(
             ProviderErrorCategory::Authentication,
-            "夸克网盘 Cookie 已失效或被拒绝",
+            format!(
+                "夸克网盘 Cookie 已失效或被拒绝 (HTTP {}{detail})",
+                status.as_u16()
+            ),
         )
     } else if status == StatusCode::NOT_FOUND {
         let path = value_string(value, &["path"]).unwrap_or_else(|| "unknown".into());
@@ -2221,6 +2304,31 @@ mod tests {
     fn cookie_validation_requires_quark_identity_cookies() {
         assert!(validate_cookie("__uid=u; __kps=k").is_ok());
         assert!(validate_cookie("__uid=u").is_err());
+    }
+
+    #[test]
+    fn qr_login_session_cookies_are_serialized_from_set_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("_UP_A_=1; Path=/; Domain=.quark.cn; HttpOnly"),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("_UP_B_=two; Max-Age=600"),
+        );
+        assert_eq!(
+            cookie_string_from_headers(&headers).as_deref(),
+            Some("_UP_A_=1; _UP_B_=two")
+        );
+
+        let request_headers = qr_session_headers("_UP_A_=1").unwrap();
+        assert_eq!(
+            request_headers
+                .get("cookie")
+                .and_then(|value| value.to_str().ok()),
+            Some("_UP_A_=1")
+        );
     }
 
     #[test]

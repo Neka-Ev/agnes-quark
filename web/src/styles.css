@@ -653,6 +653,14 @@ textarea:focus {
   color: var(--muted);
 }
 
+.form-error {
+  margin: 4px 0 0;
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .qr-box {
   display: grid;
   place-items: center;

@@ -14,10 +14,12 @@ use axum::{Json, Router};
 use chrono::Utc;
 use futures_util::Stream;
 use quark_core::domain::{
-    ListFilesRequest, ProviderAuthorizationRequest, RemoteFileKind, SearchFilesRequest,
-    StorageProviderAccount,
+    ListFilesRequest, ProviderAuthorizationRequest, ProviderError, ProviderErrorCategory,
+    RemoteFileKind, SearchFilesRequest, StorageProviderAccount,
 };
-use quark_core::ports::{ProviderAuthorizationStep, ProviderFactory, ProviderSession};
+use quark_core::ports::{
+    ProviderAuthorizationResult, ProviderAuthorizationStep, ProviderFactory, ProviderSession,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -143,12 +145,7 @@ async fn create_account(
     Json(body): Json<CreateAccountBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let result = if let Some(cookie) = non_empty(body.cookie) {
-        state
-            .legacy_factory
-            .authorize(ProviderAuthorizationRequest {
-                input: json!({ "cookie": cookie }),
-            })
-            .await?
+        authorize_cookie(&state, &cookie).await?
     } else if let Some(code) = non_empty(body.official_code) {
         state
             .factory
@@ -200,16 +197,32 @@ async fn poll_challenge(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let step = if id.starts_with("quark-qr-") {
-        state.legacy_factory.poll_authorization(&id).await?
+        state.legacy_factory.poll_authorization(&id).await
     } else {
-        state.factory.poll_authorization(&id).await?
-    };
+        state.factory.poll_authorization(&id).await
+    }
+    .map_err(challenge_error)?;
     match step {
         ProviderAuthorizationStep::Pending => Ok(Json(json!({ "status": "pending" }))),
         ProviderAuthorizationStep::Authorized(result) => {
             let view = persist_authorized(&state, result.account, result.credential, None).await?;
             Ok(Json(json!({ "status": "authorized", "account": view })))
         }
+    }
+}
+
+/// Challenge expiry is expected during interactive login. Return `410 Gone`
+/// with a dedicated code so the UI can fetch a fresh QR code instead of
+/// confusing it with a missing access token or a broken Cookie.
+fn challenge_error(error: ProviderError) -> ApiError {
+    let expired = matches!(
+        error.category,
+        ProviderErrorCategory::Authentication | ProviderErrorCategory::NotFound
+    ) && (error.message.contains("过期") || error.message.contains("不存在"));
+    if expired {
+        ApiError::new(StatusCode::GONE, "challenge_expired", error.message)
+    } else {
+        error.into()
     }
 }
 
@@ -232,12 +245,7 @@ async fn supplement_credential(
     let existing = state.vault.decrypt(&account.credential)?;
 
     let merged = if let Some(cookie) = non_empty(body.cookie) {
-        let authorized = state
-            .legacy_factory
-            .authorize(ProviderAuthorizationRequest {
-                input: json!({ "cookie": cookie }),
-            })
-            .await?;
+        let authorized = authorize_cookie(&state, &cookie).await?;
         quark_core::merge_legacy_cookie(&existing, authorized.credential.as_str())?
     } else if let Some(code) = non_empty(body.official_code) {
         let authorized = state
@@ -584,6 +592,129 @@ fn account_view(state: &AppState, record: &AccountRecord) -> AccountView {
     }
 }
 
+async fn authorize_cookie(
+    state: &AppState,
+    raw: &str,
+) -> Result<ProviderAuthorizationResult, ApiError> {
+    let cookie =
+        normalize_cookie_input(raw).ok_or_else(|| ApiError::bad_request("Cookie 不能为空"))?;
+    match state
+        .legacy_factory
+        .authorize(ProviderAuthorizationRequest {
+            input: json!({ "cookie": cookie }),
+        })
+        .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) => Err(cookie_auth_error(error, &cookie)),
+    }
+}
+
+/// Accept a raw cookie header value, a full `Cookie: ...` line, a multiline
+/// paste (one `name=value` per line), or a JSON cookie export. Control
+/// characters are replaced with spaces because the provider rejects them to
+/// prevent header injection.
+fn normalize_cookie_input(raw: &str) -> Option<String> {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let lines = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut cookie_lines = Vec::new();
+    for line in &lines {
+        if let Some(prefix) = line.get(..7) {
+            if prefix.eq_ignore_ascii_case("cookie:") {
+                cookie_lines.push(line[7..].trim());
+            }
+        }
+    }
+    let text = if !cookie_lines.is_empty() {
+        cookie_lines.join(" ")
+    } else if lines.len() > 1
+        && lines
+            .iter()
+            .all(|line| line.contains('=') && !line.starts_with('{') && !line.starts_with('['))
+    {
+        lines
+            .iter()
+            .map(|line| line.trim_end_matches(';').trim())
+            .collect::<Vec<_>>()
+            .join("; ")
+    } else {
+        normalized.clone()
+    };
+    let cleaned: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Cookie values cannot contain raw whitespace; JSON is left untouched.
+    if cleaned.starts_with('{') || cleaned.starts_with('[') {
+        Some(cleaned.to_owned())
+    } else {
+        Some(cleaned.split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+}
+
+fn cookie_names(cookie: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (name, _) in cookie
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (name.trim(), value))
+    {
+        if name.is_empty() || names.iter().any(|existing| existing.as_str() == name) {
+            continue;
+        }
+        names.push(name.chars().take(40).collect());
+    }
+    names
+}
+
+fn cookie_auth_error(error: ProviderError, cookie: &str) -> ApiError {
+    if error.category != ProviderErrorCategory::Authentication {
+        return error.into();
+    }
+
+    let names = cookie_names(cookie);
+    let mut message = error.message;
+    message.push_str(&format!(
+        "。收到的 Cookie 字段：{}",
+        if names.is_empty() {
+            "无".to_owned()
+        } else {
+            names.join(", ")
+        }
+    ));
+
+    let required = ["__pus", "__kp", "__kps", "__puus", "__uid"];
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|name| !names.iter().any(|present| present == name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        message.push_str("。请重新登录 pan.quark.cn 后复制最新 Cookie，或直接使用扫码登录");
+    } else {
+        message.push_str(&format!(
+            "。缺少 {}；请确认浏览器处于已登录状态（不是访客），并从任意 drive.quark.cn 请求复制完整 Cookie，或直接使用扫码登录",
+            missing.join(", ")
+        ));
+    }
+
+    ApiError::new(StatusCode::UNAUTHORIZED, "authentication", message)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
@@ -662,4 +793,89 @@ fn percent_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&output).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_input_accepts_header_prefix_and_multiline_pastes() {
+        assert_eq!(
+            normalize_cookie_input("Cookie: __uid=u; __kps=k").as_deref(),
+            Some("__uid=u; __kps=k")
+        );
+        assert_eq!(
+            normalize_cookie_input("__uid=u;\n__kps=k\n").as_deref(),
+            Some("__uid=u; __kps=k")
+        );
+        assert_eq!(
+            normalize_cookie_input("__uid=u\n__kps=k").as_deref(),
+            Some("__uid=u; __kps=k")
+        );
+        assert_eq!(normalize_cookie_input("   \n\t  "), None);
+    }
+
+    #[test]
+    fn cookie_input_strips_control_characters() {
+        let normalized = normalize_cookie_input("__uid=u;\u{0000}__kps=k").unwrap();
+        assert_eq!(normalized, "__uid=u; __kps=k");
+        assert!(!normalized.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn cookie_input_keeps_json_exports_intact() {
+        let input = "{\n  \"cookies\": {\"__uid\": \"u\", \"__kps\": \"k\"}\n}";
+        let normalized = normalize_cookie_input(input).unwrap();
+        assert!(normalized.starts_with('{'));
+        assert!(normalized.contains("\"__kps\": \"k\""));
+    }
+
+    #[test]
+    fn cookie_names_are_unique_and_ignore_malformed_pairs() {
+        assert_eq!(
+            cookie_names("__uid=u; __kps=k; __uid=other; broken; =empty"),
+            vec!["__uid", "__kps"]
+        );
+    }
+
+    #[test]
+    fn authentication_errors_explain_missing_cookie_fields() {
+        let error = cookie_auth_error(
+            ProviderError::new(ProviderErrorCategory::Authentication, "上游拒绝登录"),
+            "__uid=u; __kps=k",
+        );
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.code, "authentication");
+        assert!(error.message.contains("__pus"));
+        assert!(error.message.contains("__puus"));
+        assert!(!error.message.contains("缺少 __uid"));
+        assert!(!error.message.contains("缺少 __kps"));
+    }
+
+    #[test]
+    fn non_authentication_errors_keep_their_category() {
+        let error = cookie_auth_error(
+            ProviderError::new(ProviderErrorCategory::RateLimit, "请求太快"),
+            "__uid=u; __kps=k",
+        );
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.message, "请求太快");
+    }
+
+    #[test]
+    fn expired_challenges_are_reported_as_gone() {
+        let error = challenge_error(ProviderError::new(
+            ProviderErrorCategory::Authentication,
+            "夸克二维码已过期，请重新获取",
+        ));
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.code, "challenge_expired");
+
+        let error = challenge_error(ProviderError::new(
+            ProviderErrorCategory::RemoteUnavailable,
+            "上游暂时不可用",
+        ));
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+    }
 }
