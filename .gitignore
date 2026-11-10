@@ -15,6 +15,7 @@ master.key
 .env
 .env.local
 *.log
+.dev-logs/
 .DS_Store
 .vscode/
 .idea/

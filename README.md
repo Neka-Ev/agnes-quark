@@ -50,6 +50,9 @@
 │           ├── state.rs
 │           └── web.rs          # 嵌入前端
 ├── web/                        # React + Vite + TypeScript（纯 CSS）
+├── scripts/
+│   ├── dev.sh                  # 开发模式：同时拉起后端与前端热更新
+│   └── start.sh                # 生产模式：构建并运行单个二进制
 ├── deploy/
 │   ├── quark-drive.service
 │   └── Dockerfile
@@ -182,6 +185,27 @@ GET    /api/downloads/events                # SSE，事件名 downloads
 - 共享服务器上请限制 `data/` 与 `downloads/` 的 UNIX 权限。
 
 ## 开发
+
+一键拉起前后端（前端热更新，`/api` 代理到后端 8787）：
+
+```bash
+scripts/dev.sh
+```
+
+- 访问 <http://127.0.0.1:5173>；`Ctrl-C` 同时停止前后端。
+- 首次运行会自动 `npm ci`，日志按行加前缀输出，同时写入 `.dev-logs/`。
+- 后端首次编译较慢，脚本会轮询 `/api/health` 等待就绪。
+- `QUARK_TOKEN`、`QUARK_DATA_DIR`、`QUARK_DOWNLOAD_ROOT` 等环境变量照常生效；额外参数会透传给 `quark-server`。
+- 前端改动即时生效；后端改动需要重启脚本。
+
+生产模式（构建前端 + release 二进制，前端资源内嵌，只需 8787 一个端口）：
+
+```bash
+scripts/start.sh            # 构建并启动
+SKIP_BUILD=1 scripts/start.sh   # 跳过构建，直接启动已有二进制
+```
+
+手动分步启动：
 
 ```bash
 # 终端 1：后端
