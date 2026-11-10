@@ -1,55 +1,20 @@
-# dependencies
-node_modules
-.pnpm-store
+# 编译产物
+/target
+/web/node_modules
+/web/dist
 
-# builds
-dist
-android-runtime/*
-!android-runtime/README.md
-!android-runtime/sources.lock.json
-!android-runtime/patches/
-!android-runtime/patches/**
-src-tauri/target
-src-tauri/gen
-claude-extracted/
-stitch_claude_aesthetic_design_system/
-quarkapi/
-quarkclouddrive-*.zip
+# 运行时数据
+/data
+/downloads
+*.db
+*.db-shm
+*.db-wal
+master.key
 
-# python
-agent/.venv
-agent/.sidecar-build
-agent/.sidecar-dist
-agent/*.spec
-document-parser/.venv
-document-parser/.sidecar-build
-document-parser/.sidecar-dist
-document-parser/*.spec
-pdf-parser/.venv
-pdf-parser/.models*
-pdf-parser/.sidecar-build
-pdf-parser/.sidecar-dist
-pdf-parser/.package-dist
-pdf-parser/*.spec
-agent/__pycache__
-**/__pycache__
-*.pyc
-
-# tauri
-src-tauri/binaries
-src-tauri/target/*
-
-# env / secrets
+# 本地环境
 .env
-.env.*
-*.local
-.dev.vars
-.wrangler
-client_secret_*.apps.googleusercontent.com.json
-
-# os
+.env.local
+*.log
 .DS_Store
-
-# Android release signing (local only)
-src-tauri/gen/android/keystore.properties
-src-tauri/gen/android/app/*.jks
+.vscode/
+.idea/

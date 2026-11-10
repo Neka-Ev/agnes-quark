@@ -1,157 +1,242 @@
-# Agnes Agent
+# Quark Drive Server
 
-<div align="center">
+把夸克网盘内容下载到无界面 Linux 服务器的轻量应用。单个 Rust 二进制同时提供 HTTP API 和浏览器 UI，适合通过 SSH 端口转发或 VS Code Remote 访问。
 
-**带 Agent 能力的 AI 角色扮演情感陪伴与个人知识效率工作台**
+从 [agnes-agent](https://github.com/Gongcai/agnes-agent) 中抽离夸克 Provider 而来，本仓库只保留夸克网盘相关能力。
 
-[特性概览](#核心业务功能) • [独创记忆系统](#核心差异化新一代持久记忆文件系统) • [技术栈](#技术栈与架构) • [快速开始](#常用命令)
+## 功能
 
-</div>
+- Cookie 粘贴登录、二维码登录、官方授权码/授权页登录
+- 浏览目录、搜索文件、查看配额
+- 单文件下载、文件夹递归下载
+- 任务排队、进度展示、取消、失败重试
+- 断点续传：重启服务或网络中断后从 `.part` 文件继续
+- 加密凭证库：ChaCha20-Poly1305 + 本地 `master.key`（0600）或 `QUARK_VAULT_KEY`
+- 默认仅监听 `127.0.0.1`；非回环地址强制要求 Bearer Token
+- 前端资源编译进二进制，部署时只需要一个可执行文件
 
----
+## 重要限制
 
-## 💡 项目定位
+夸克官方 Open API **不支持目录浏览**，只支持搜索、下载等能力。
 
-`Agnes` 是一款融合了**AI角色扮演情感陪伴**与**自主 Agent 工具执行能力**的跨平台应用（支持 Linux、Windows 与 Android）。每个 Agent 拥有独立的人设、系统提示词、工具权限和按角色隔离的长期记忆体系。
+因此：
 
-桌面端在宿主环境提供安全的隔离沙箱；安卓端则内置完整的 PRoot/Ubuntu Linux 运行时，在移动设备本地运行完整 Agent 与交互式终端。
+- **Cookie 登录**：支持浏览、搜索、单文件下载、文件夹下载。
+- **二维码登录**：本质上也是获取 Cookie，能力同上。
+- **官方授权**：支持搜索和单文件下载；如需浏览目录或下载整个文件夹，请在账户卡片里补充一次 Cookie，服务端会把官方凭证和 Cookie 合并保存。
 
----
-
-## 🚀 核心业务功能
-
-系统侧重于深度日常交流、代码协作、知识阅读与日程规划，核心主打以下功能：
-
-### 1. 智能聊天工作区 (Chat Workspace)
-- **Home / Code 双模式**：
-  - **Home 模式**：面向通用生活与日常对话，共享系统级通用文档空间（`Agnes/Home`）。
-  - **Code 模式**：面向专业软件开发，绑定本地代码仓库，严格注入编码工作流规范。
-- **深度推理思考（Thinking Models）**：全面适配推理大模型，提供关闭/自动/轻度/中等/深度多级思考控制，交互界面优雅折叠与平滑展示。
-- **代码对比与变更审查（Diff Review）**：工具在执行文件写入或补丁前，强制渲染结构化 Diff 预览，支持人工逐次确认。
-- **上下文感知环（Context Ring）**：实时监测会话 Token 开销与模型窗口预算，提供越限自动压缩预警。
-
-### 2. 伴读系统 (Read With AI)
-- **EPUB 原生渲染与书架**：支持 EPUB 2/3 标准电子书本地解析、自适应排版与双端阅读进度追踪。
-- **精确文本划线（CFI 标注）**：支持阅读过程中圈选高亮与批注。
-- **角色卡伴读深度讨论**：针对单本书籍与特定 Agent 建立专属讨论上下文，支持精准引述章节内容；具备未知书籍首次书内检索授权机制。
-- **加密电子书云同步**：通过加密 `reading_epub` 制品实现多端原书同步与划线漫游。
-
-### 3. 本地日历与日程管理 (Calendar)
-- **全能视图排程**：支持月、周、日与当天议程（Agenda）多维度视图，支持多日历分类与颜色标签。
-- **重复规则与日程图层**：支持标准 RRULE 周期规则与单次例外管理，支持日程图层与待办事项叠加显示。
-- **Agent 双向联动**：Agent 可在权限许可下受控查询日程冲突、协助排期并录入日程事件。
-
-### 4. 智能待办清单 (Tasks)
-- **智能工作视图**：内置“我的一天”、“重要”、“计划内”、“已完成”等智能过滤视图。
-- **任务深度拆解**：支持任务子步骤细分、精确时间提醒与完成自动生成下一周期实例。
-- **Agent 意图捕获**：在聊天中直接感知行动项，一键或自动转换为待办事项。
-
-### 5. 多网盘适配与自动备份（重点：夸克网盘深度适配）
-- **夸克网盘（Quark Drive）官方接口深度适配**：
-  - **服务端权威分块机制**：适配官方 API，依据服务端动态返回的权威 `part_size` 进行动态切片（内置 4 MiB 安全 fallback）。
-  - **单并发限流保护与背压控制**：采用单 Worker 串行分块上传与传输队列，规避高频并发封禁。
-  - **自适应频控退避（429 Throttling Circuit Breaker）**：精准捕获 HTTP 429 与频率超限响应，继承服务端的 `Retry-After`，配合指数退避（Exponential Backoff）与随机抖动（Jitter），触发频控时自动熔断休眠。
-  - **直接资源导入**：支持将夸克网盘中的电子书与文档免下载直接导入到本地阅读书架或知识库中。
-- **Google Drive 适配**：接入官方 Drive API，支持断点续传（Resumable Uploads，8 MiB 切片）与 700 GiB 每日安全预算保护。
-- **全自动加密备份引擎**：
-  - **客户端加密制品（Client-Encrypted Artifacts）**：备份单元为本地构建、压缩并客户端加密的不可变快照包（非裸露的 SQLite/WAL 库），确保云端零知识（Zero-Knowledge）。
-  - **密文哈希去重与原子校验**：通过制品 ID 与密文 Hash 校验远程完整性，支持网络中断断点续推与后台安全静默备份。
-
----
-
-## 🧠 核心差异化：新一代持久记忆文件系统
-
-与绝大多数 Agent 产品采用的“粗暴向量检索（RAG）”或“黑盒后台 Extractor”不同，Agnes 采用**以 Agent 角色隔离的虚拟 Markdown 记忆文件系统**作为唯一的长期记忆真相源。
+## 架构
 
 ```text
-┌────────────────────────────────────────────────────────┐
-│                   四层渐进式记忆模型                     │
-├────────────────────────────────────────────────────────┤
-│ ① Recent Context         会话最近原文（受预算窗口约束） │
-│ ② Conversation Summary   较早消息滚动摘要（会话内压缩）  │
-│ ③ Always-on Memory Index 常驻轻量索引（<listing> 清单） │
-│ ④ On-demand Memory Files 主题记忆正文（按需工具读取）   │
-└────────────────────────────────────────────────────────┘
+.
+├── Cargo.toml                  # Rust workspace
+├── crates/
+│   ├── quark-core/             # 从 agnes-agent 抽离的夸克 Provider（无 Tauri 依赖）
+│   │   └── src/
+│   │       ├── domain.rs
+│   │       ├── ports.rs
+│   │       ├── quark_drive.rs             # Cookie / 二维码 / 浏览 / 下载
+│   │       └── quark_drive_official.rs    # 官方 API + 凭证合并
+│   └── quark-server/           # axum 服务 + SQLite + 下载引擎
+│       ├── build.rs            # 确保 rust-embed 有 web/dist
+│       └── src/
+│           ├── main.rs
+│           ├── api.rs          # HTTP JSON API、SSE、Token 中间件
+│           ├── db.rs           # 账户、下载任务
+│           ├── download.rs     # 断点续传、文件夹递归、路径安全
+│           ├── vault.rs        # 加密凭证库
+│           ├── config.rs
+│           ├── error.rs
+│           ├── state.rs
+│           └── web.rs          # 嵌入前端
+├── web/                        # React + Vite + TypeScript（纯 CSS）
+├── deploy/
+│   ├── quark-drive.service
+│   └── Dockerfile
+├── LICENSE
+└── NOTICE
 ```
 
-### 1. 为什么拒绝传统方案？
-| 传统方案弊端 | Agnes 创新解法 |
-|---|---|
-| **向量检索噪音大**：易检索出语义相似但时效过期或语境不符的碎片。 | **目录导航 + 模型意图**：通过结构化文件路径（`/topics/`、`/areas/`、`/people/`）按需加载，语义完整。 |
-| **后台 Extractor 偷跑与臆测**：常在后台消耗昂贵 Token，将模型猜测或网页引用当成用户事实写入。 | **纯事实驱动（Stated Facts Only）**：当前轮次即时提取，**严格仅允许写入用户明确说过的真实事实**，杜绝幻想推断。 |
-| **记忆上下文急剧膨胀**：历史记忆全量或半全量塞入 Prompt 导致爆窗。 | **Listing-First 极轻量常驻**：常驻注入仅包含路径与简短 Description 的清单，正文通过 `memory_read` 按需拉取。 |
-| **多端并发静默覆盖**：跨设备同步或多会话并行时后写覆盖先写（LWW 导致数据丢失）。 | **CAS（比较并交换）乐观锁**：修改必须持有上一次读取的 Version Token，冲突时由系统保留多版本并显式处理。 |
+## 快速开始
 
-### 2. 虚拟文件系统规范
-- **文件组织与隔离**：
-  - 所有长期记忆数据均严格按 `agent_id` 物理隔离，一个 Agent 无法越权读写另一个 Agent 的记忆。
-  - `/profile.md`：记录用户的稳定身份背景。
-  - `/preferences.md`：记录用户明确要求的交互偏好与风格。
-  - `/topics/<domain>.md`、`/areas/<name>.md`、`/people/<name>.md`：结构化沉淀垂直领域经验与人际事实，支持 `[[name]]` 双向链接。
-- **透明可控与端到端加密**：
-  - 用户可在设置中像编辑标准 Markdown 一样查看、修改或撤回所有记忆文件。
-  - 记忆文件同步通过端到端加密（E2EE，ChaCha20-Poly1305），服务器端无法探知记忆明文。
+### 1. 构建
 
----
+```bash
+# 前端
+cd web
+npm install
+npm run build
+cd ..
 
-## 🛠️ 技术栈与架构
+# 后端（会把 web/dist 嵌入二进制）
+cargo build --release -p quark-server
+```
+
+依赖：
+
+- Rust 1.80+（本仓库在 1.99 上验证）
+- Node.js 18+
+- Linux 需要 `ca-certificates`，否则访问夸克 HTTPS 会失败
+
+### 2. 启动
+
+```bash
+./target/release/quark-server \
+  --listen 127.0.0.1:8787 \
+  --data-dir ./data \
+  --download-root ./downloads
+```
+
+浏览器打开 <http://127.0.0.1:8787>。
+
+如果服务器只能通过 SSH 访问：
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 user@server
+```
+
+然后在本地打开 <http://127.0.0.1:8787>。VS Code Remote SSH 也可以直接转发 8787 端口。
+
+### 3. 登录
+
+- **二维码**：点击「扫码登录」，用夸克 App 扫码。二维码链接会渲染成图片，不依赖第三方二维码服务。
+- **Cookie**：浏览器登录 `pan.quark.cn`，从开发者工具复制请求头 Cookie。至少需要 `__kps`、`__uid`。
+- **官方授权**：点击「官方授权」，在打开的夸克页面确认；也可以粘贴授权码。之后如需浏览目录，点账户上的「补充 Cookie」。
+
+## 配置
+
+| 参数 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `--listen` | `QUARK_LISTEN` | `127.0.0.1:8787` | 监听地址 |
+| `--data-dir` | `QUARK_DATA_DIR` | `./data` | SQLite 与凭证密钥目录 |
+| `--download-root` | `QUARK_DOWNLOAD_ROOT` | `./downloads` | 下载根目录 |
+| `--token` | `QUARK_TOKEN` | 空 | API 访问令牌 |
+| `--allow-insecure` | `QUARK_ALLOW_INSECURE` | `false` | 允许无令牌监听非回环地址 |
+| `--concurrency` | `QUARK_CONCURRENCY` | `1` | 下载并发数（1–8） |
+| - | `QUARK_VAULT_KEY` | 空 | 覆盖 `master.key`；64 位 hex 或任意口令（SHA-256 派生） |
+
+示例：
+
+```bash
+QUARK_TOKEN='change-me' ./target/release/quark-server \
+  --listen 0.0.0.0:8787 \
+  --data-dir /var/lib/quark-drive \
+  --download-root /srv/quark-downloads \
+  --concurrency 2
+```
+
+设置令牌后：
+
+- API 请求需要 `Authorization: Bearer <token>`；
+- 浏览器 UI 右上角「设置访问令牌」保存到 `localStorage`；
+- SSE 进度流使用 `?token=<token>`。
+
+## 下载行为
+
+- 单文件写入确定性的 `.文件名.part`，完成后 `fsync` 并原子重命名。
+- 重启后 `running` 任务自动回到 `queued`，按 `.part` 大小发起 Range 请求继续下载。
+- 文件夹递归限制：最多 64 层、10,000 个文件。
+- 目录或文件名中的 `/`、`\`、控制字符会替换为 `_`；重名时自动追加 ` (1)` 等后缀。
+- API 只接受相对 `relative_dir`；服务端拼接下载根目录并 `canonicalize` 校验，拒绝 `..`、绝对路径和符号链接逃逸。
+- 所有文件都下载到 `--download-root`，不执行任何安装脚本或任意命令。
+
+## HTTP API
 
 ```text
-┌────────────────────────────────────────────────────────┐
-│                    Tauri 2 客户端                      │
-│       React + TypeScript + Tailwind (Shadcn/UI)        │
-└───────────────────────────┬────────────────────────────┘
-                            │ IPC
-┌───────────────────────────▼────────────────────────────┐
-│                    Rust Core 宿主引擎                  │
-│       Tokio + SQLite (带 sqlite-vec) + Portable PTY    │
-└───────────────────────────┬────────────────────────────┘
-                            │ WebSocket / JSON-RPC
-┌───────────────────────────▼────────────────────────────┐
-│                 Python Agent Sidecar                   │
-│         LangGraph + LiteLLM + MCP + FastAPI            │
-└────────────────────────────────────────────────────────┘
+GET    /api/health
+GET    /api/config
+
+GET    /api/accounts
+POST   /api/accounts                        # { cookie | official_code, display_name? }
+DELETE /api/accounts/:id
+POST   /api/accounts/:id/credential         # { cookie | official_code }
+POST   /api/accounts/challenges             # { method: "qr" | "official" }
+GET    /api/accounts/challenges/:id
+
+GET    /api/accounts/:id/quota
+GET    /api/accounts/:id/files?parent_id=&page_token=&page_size=
+GET    /api/accounts/:id/search?q=&page_token=&page_size=
+
+POST   /api/accounts/:id/downloads          # { file_id | folder_id, relative_dir? }
+GET    /api/downloads
+GET    /api/downloads/:id
+POST   /api/downloads/:id/cancel
+POST   /api/downloads/:id/retry
+DELETE /api/downloads/:id
+GET    /api/downloads/events                # SSE，事件名 downloads
 ```
 
-- **跨平台运行时**：
-  - **Linux 桌面**：Tauri 2 + Bubblewrap 沙箱 + PipeWire 硬件级 AEC。
-  - **Android 移动端**：Tauri Android + Android Foreground Service + 内置 PRoot/Ubuntu ARM64 Linux 环境。
-- **协议与扩展**：工具体系完全兼容 **MCP (Model Context Protocol)** 与 `SKILL.md` 规范。
-- **云端同步控制面**：Cloudflare Workers + Hono + D1 数据库（仅做密文增量 Outbox 与清单同步，零明文接触）。
+错误响应统一为：
 
----
+```json
+{ "error": { "code": "authentication", "message": "..." } }
+```
 
-## 💻 常用命令
+## 安全说明
 
-### 桌面端开发与构建
+- 凭证不以明文落盘：SQLite 只保存密文，密钥在 `data/master.key`，首次启动生成，权限 0600。
+- API 响应与日志不会返回 Cookie 或官方 token。
+- 默认仅回环监听；公网部署请使用反向代理 + TLS + 强令牌。
+- 建议通过 SSH 隧道访问，而不是直接把端口暴露到公网。
+- 共享服务器上请限制 `data/` 与 `downloads/` 的 UNIX 权限。
+
+## 开发
+
 ```bash
-# 安装依赖
-pnpm install
+# 终端 1：后端
+cargo run -p quark-server -- \
+  --listen 127.0.0.1:8787 \
+  --data-dir ./data \
+  --download-root ./downloads
 
-# 启动桌面开发模式（Sidecar 自动通过 uv 托管拉起）
-pnpm tauri dev
-
-# 发布打包（自动构建并冻结内置 agentd 二进制）
-pnpm tauri build
+# 终端 2：前端热更新（/api 代理到 8787）
+cd web
+npm install
+npm run dev
 ```
 
-### Python Agent Sidecar
+测试：
+
 ```bash
-cd agent
-uv sync
-
-# 运行测试
-uv run pytest
+cargo test --workspace
+cd web && npm run build
 ```
 
-### 安卓端构建
+前端构建产物会被 `rust-embed` 嵌入；`build.rs` 在 `web/dist` 缺失时写入占位页，保证后端可以先编译。
+
+## systemd
+
 ```bash
-# 自动配置 NDK 并构建 ARM64 APK
-pnpm android:build
+sudo install -m 0755 target/release/quark-server /usr/local/bin/quark-server
+sudo useradd --system --home /var/lib/quark-drive --shell /usr/sbin/nologin quark
+sudo install -d -o quark -g quark -m 0700 /var/lib/quark-drive
+sudo install -d -o quark -g quark /srv/quark-downloads
+sudo install -m 0644 deploy/quark-drive.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now quark-drive
 ```
 
----
+服务文件默认监听 `127.0.0.1:8787`，通过 SSH 隧道访问。
 
-## 📄 开源许可
+## Docker
 
-本项目采用 [Apache-2.0 License](LICENSE) 许可协议。
+```bash
+docker build -f deploy/Dockerfile -t quark-drive-server .
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -e QUARK_TOKEN=change-me \
+  -v quark-data:/data \
+  -v /srv/quark-downloads:/downloads \
+  quark-drive-server
+```
+
+## 已知限制
+
+- 夸克接口可能随官方策略变化，登录或下载失败时请先升级 Provider。
+- 官方授权不提供目录浏览，需要额外 Cookie。
+- 暂不支持上传、分享转存、媒体播放、TUI。
+- 下载任务不做磁盘空间预检，请自行监控 `download-root` 所在分区。
+- 大型文件夹会先枚举全部文件再顺序下载；重新运行会跳过已存在且大小一致的文件。
+
+## 许可证
+
+Apache License 2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。

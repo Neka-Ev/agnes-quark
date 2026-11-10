@@ -1,0 +1,10 @@
+Quark Drive Server
+==================
+
+This product includes software derived from agnes-agent:
+
+    https://github.com/Gongcai/agnes-agent
+
+The Quark Drive provider modules under crates/quark-core are adapted from the
+agnes-agent project and are redistributed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.

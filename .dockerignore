@@ -1,9 +1,8 @@
+# 忽略构建与运行时产物
+target
+web/node_modules
+web/dist
+data
+downloads
+*.log
 .git
-.gitignore
-node_modules
-**/node_modules
-**/.wrangler
-**/.dev.vars
-**/vps-data
-src-tauri/target
-dist

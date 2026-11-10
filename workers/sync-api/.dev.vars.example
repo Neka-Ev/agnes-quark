@@ -1,2 +1,0 @@
-AUTH_MODE="test"
-SYNC_TEST_IDENTITIES='[{"token":"replace-with-a-random-token","ownerId":"local-owner","deviceId":"00000000-0000-4000-8000-000000000001","deviceName":"Local server","platform":"server"}]'

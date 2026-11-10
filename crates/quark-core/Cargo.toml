@@ -1,0 +1,23 @@
+[package]
+name = "quark-core"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Quark Drive provider extracted from agnes-agent"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = "0.4"
+futures-util = "0.3"
+md-5 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "gzip", "brotli", "deflate", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "v5"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
