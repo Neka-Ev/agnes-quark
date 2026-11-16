@@ -116,6 +116,8 @@ ssh -N -L 8787:127.0.0.1:8787 user@server
 | `--token` | `QUARK_TOKEN` | 空 | API 访问令牌 |
 | `--allow-insecure` | `QUARK_ALLOW_INSECURE` | `false` | 允许无令牌监听非回环地址 |
 | `--concurrency` | `QUARK_CONCURRENCY` | `1` | 下载并发数（1–8） |
+| - | `QUARK_CHUNK_SIZE` | `4194304` | 单文件分块大小（字节，64 KiB–64 MiB） |
+| - | `QUARK_PARALLEL_PER_FILE` | `8` | 单文件分块并发连接数（1–32） |
 | - | `QUARK_VAULT_KEY` | 空 | 覆盖 `master.key`；64 位 hex 或任意口令（SHA-256 派生） |
 
 示例：
@@ -136,8 +138,9 @@ QUARK_TOKEN='change-me' ./target/release/quark-server \
 
 ## 下载行为
 
-- 单文件写入确定性的 `.文件名.part`，完成后 `fsync` 并原子重命名。
-- 重启后 `running` 任务自动回到 `queued`，按 `.part` 大小发起 Range 请求继续下载。
+- 单文件按字节范围并行分块下载，临时分块写入 `.文件名.part.N`；所有分块完成后按序合并并原子重命名。
+- 重启后 `running` 任务自动回到 `queued`，每个分块按本地 `.part.N` 大小发起 Range 请求继续下载；旧版 `.part` 临时文件会迁移后继续下载。
+- 文件夹下载以所选文件夹作为本地根目录，不保留其上层远端路径。
 - 文件夹递归限制：最多 64 层、10,000 个文件。
 - 目录或文件名中的 `/`、`\`、控制字符会替换为 `_`；重名时自动追加 ` (1)` 等后缀。
 - API 只接受相对 `relative_dir`；服务端拼接下载根目录并 `canonicalize` 校验，拒绝 `..`、绝对路径和符号链接逃逸。
@@ -231,17 +234,43 @@ cd web && npm run build
 
 ## systemd
 
+无需管理员权限时，推荐安装为当前用户的 systemd 服务（user unit）。服务默认监听 `127.0.0.1:8787`，数据保存在 `~/.local/share/quark-drive`，下载保存在 `~/Downloads/quark-drive`。
+
 ```bash
-sudo install -m 0755 target/release/quark-server /usr/local/bin/quark-server
-sudo useradd --system --home /var/lib/quark-drive --shell /usr/sbin/nologin quark
-sudo install -d -o quark -g quark -m 0700 /var/lib/quark-drive
-sudo install -d -o quark -g quark /srv/quark-downloads
-sudo install -m 0644 deploy/quark-drive.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now quark-drive
+# 构建并安装到当前用户目录
+cargo build --release -p quark-server
+install -d "$HOME/.local/bin" "$HOME/.config/systemd/user"
+install -m 0755 target/release/quark-server "$HOME/.local/bin/quark-server"
+install -m 0644 deploy/quark-drive.user.service \
+  "$HOME/.config/systemd/user/quark-drive.service"
+
+# 可选：在此文件中设置 QUARK_TOKEN、QUARK_DATA_DIR、QUARK_DOWNLOAD_ROOT 等变量
+# 若要沿用已有数据，请将 QUARK_DATA_DIR 和 QUARK_DOWNLOAD_ROOT 指向原目录
+install -d -m 0700 "$HOME/.config"
+# 创建或编辑环境配置文件：
+${EDITOR:-vi} "$HOME/.config/quark-drive.env"
+# 按 KEY=value 格式填写，例如：
+# QUARK_DATA_DIR=/path/to/existing/data
+# QUARK_DOWNLOAD_ROOT=/path/to/existing/downloads
+# QUARK_TOKEN=your-token
+
+systemctl --user daemon-reload
+systemctl --user enable --now quark-drive.service
 ```
 
-服务文件默认监听 `127.0.0.1:8787`，通过 SSH 隧道访问。
+常用管理命令（均不需要 `sudo`）：
+
+```bash
+systemctl --user status quark-drive.service
+systemctl --user restart quark-drive.service
+systemctl --user stop quark-drive.service
+systemctl --user start quark-drive.service
+journalctl --user -u quark-drive.service -f
+```
+
+更新二进制后重新执行 `install -m 0755 target/release/quark-server "$HOME/.local/bin/quark-server"`，然后运行 `systemctl --user restart quark-drive.service`。如需在退出登录后仍运行，系统需允许 user lingering（通常由管理员通过 `loginctl enable-linger <用户名>` 开启）。
+
+`deploy/quark-drive.service` 是安装到系统级 systemd manager 的模板，需要管理员权限；没有 sudo 权限时请使用上面的 `quark-drive.user.service`。
 
 ## Docker
 

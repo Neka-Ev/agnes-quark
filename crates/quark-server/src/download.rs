@@ -1,25 +1,27 @@
-//! Download engine: single-file transfers and recursive folder downloads.
+//! Download engine: parallel chunked file transfers and recursive folder downloads.
 //!
 //! Downloads are resumable: the partial payload is written to a deterministic
-//! `.part` file next to the destination and continued with HTTP Range requests
-//! after a restart or a transient network failure.
+//! per-chunk `.part` files next to the destination and continued with HTTP Range
+//! requests after a restart or a transient network failure.
 
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::stream;
+use futures_util::{StreamExt, TryStreamExt};
 use quark_core::domain::{
-    DownloadFileRequest, ListFilesRequest, ProviderByteStream, ProviderError,
-    ProviderErrorCategory, ProviderResult, RemoteFileItem, RemoteFileKind, StorageProviderAccount,
+    DownloadFileRequest, ListFilesRequest, ProviderError, ProviderErrorCategory, ProviderResult,
+    RemoteFileItem, RemoteFileKind, StorageProviderAccount,
 };
 use quark_core::ports::{FileSourceProvider, ProviderCredentialAccess, ProviderFactory};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -32,6 +34,8 @@ const MAX_FOLDER_DEPTH: usize = 64;
 const MAX_FOLDER_ITEMS: usize = 10_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const PROGRESS_BYTES: u64 = 1024 * 1024;
+const MIN_CHUNK_SIZE: u64 = 64 * 1024;
+const MAX_PARALLEL_PER_FILE: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
@@ -74,6 +78,16 @@ struct Inner {
     root_canonical: PathBuf,
     sender: mpsc::UnboundedSender<String>,
     cancellations: StdMutex<HashMap<String, Arc<AtomicBool>>>,
+    chunk_size: u64,
+    parallel_per_file: usize,
+}
+
+/// Runtime tuning for file transfers.
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadTuning {
+    pub concurrency: usize,
+    pub chunk_size: u64,
+    pub parallel_per_file: usize,
 }
 
 impl DownloadEngine {
@@ -84,7 +98,7 @@ impl DownloadEngine {
         factory: Arc<quark_core::QuarkDriveFactory>,
         root: PathBuf,
         root_canonical: PathBuf,
-        concurrency: usize,
+        tuning: DownloadTuning,
     ) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
@@ -97,10 +111,12 @@ impl DownloadEngine {
                 root_canonical,
                 sender,
                 cancellations: StdMutex::new(HashMap::new()),
+                chunk_size: tuning.chunk_size.clamp(MIN_CHUNK_SIZE, 64 * 1024 * 1024),
+                parallel_per_file: tuning.parallel_per_file.clamp(1, MAX_PARALLEL_PER_FILE),
             }),
         };
 
-        for index in 0..concurrency.max(1) {
+        for index in 0..tuning.concurrency.max(1) {
             let engine = engine.clone();
             let receiver = receiver.clone();
             tokio::spawn(async move {
@@ -441,124 +457,103 @@ impl DownloadEngine {
             .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| safe_name.clone());
-        let part = dir.join(format!(".{file_name}.part"));
+        let legacy_part = dir.join(format!(".{file_name}.part"));
+        let chunk_size = self.inner.chunk_size;
+        let chunk_count = file.size.map(|size| {
+            if size == 0 {
+                1
+            } else {
+                size.div_ceil(chunk_size) as usize
+            }
+        });
+        let chunk_count = chunk_count.unwrap_or(1);
+        let chunks = (0..chunk_count)
+            .map(|index| {
+                let start = index as u64 * chunk_size;
+                let expected_len = file
+                    .size
+                    .map(|size| size.saturating_sub(start).min(chunk_size));
+                let end = expected_len
+                    .filter(|length| *length > 0)
+                    .map(|length| start + length - 1);
+                ChunkSpec {
+                    index,
+                    start,
+                    end,
+                    expected_len,
+                    path: dir.join(chunk_file_name(&file_name, index)),
+                }
+            })
+            .collect::<Vec<_>>();
 
-        let mut offset = tokio::fs::metadata(&part)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if let Some(size) = file.size {
-            if offset > size {
-                let _ = tokio::fs::remove_file(&part).await;
-                offset = 0;
-            }
-            if offset == size && size > 0 {
-                replace_target(&part, &target).await?;
-                return Ok(offset);
-            }
+        // Chunk boundaries depend on `chunk_size`, so resuming with a different
+        // chunk size while reusing `.part.N` files would silently corrupt the
+        // output. Remember the settings with the partials and start over when
+        // they changed.
+        let meta_path = dir.join(format!(".{file_name}.part.meta"));
+        let meta = format!(
+            "{chunk_size}\t{}",
+            file.size.map(|size| size.to_string()).unwrap_or_default()
+        );
+        if tokio::fs::read_to_string(&meta_path).await.ok().as_deref() != Some(meta.as_str()) {
+            remove_part_chunks(dir, &file_name).await?;
+            tokio::fs::write(&meta_path, &meta).await?;
         }
 
-        let mut output = tokio::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&part)
+        self.migrate_legacy_partial(&legacy_part, &chunks, file.size)
             .await?;
 
-        let mut transferred = offset;
-        let mut attempts = 0_usize;
-        let mut last_report = Instant::now();
-        let mut last_reported_bytes = transferred;
-
-        loop {
-            if cancel.load(Ordering::SeqCst) {
-                let _ = output.flush().await;
-                return Err(DownloadError::Cancelled);
+        let mut initial_bytes = 0_u64;
+        for chunk in &chunks {
+            let length = tokio::fs::metadata(&chunk.path)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if chunk.expected_len.is_some_and(|expected| length > expected) {
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&chunk.path)
+                    .await?
+                    .set_len(0)
+                    .await?;
+            } else {
+                initial_bytes = initial_bytes.saturating_add(length);
             }
-
-            let request = DownloadFileRequest {
-                file_id: file.id.clone(),
-                range_start: (transferred > 0).then_some(transferred),
-                range_end_inclusive: None,
-                expected_revision: None,
-            };
-
-            let mut stream: ProviderByteStream = match source.download_file(request).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    if retryable(&error) && attempts + 1 < MAX_ATTEMPTS {
-                        retry_delay(&error, attempts).await;
-                        attempts += 1;
-                        continue;
-                    }
-                    return Err(error.into());
-                }
-            };
-
-            let mut interrupted: Option<ProviderError> = None;
-            while let Some(chunk) = stream.next().await {
-                if cancel.load(Ordering::SeqCst) {
-                    let _ = output.flush().await;
-                    return Err(DownloadError::Cancelled);
-                }
-                let bytes = match chunk {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        interrupted = Some(error);
-                        break;
-                    }
-                };
-                if bytes.is_empty() {
-                    continue;
-                }
-                let next = transferred.saturating_add(bytes.len() as u64);
-                if let Some(size) = file.size {
-                    if next > size {
-                        return Err(failure(format!(
-                            "服务端返回的数据超过预期大小（{next} > {size}）"
-                        )));
-                    }
-                }
-                output.write_all(&bytes).await?;
-                transferred = next;
-
-                if last_report.elapsed() >= PROGRESS_INTERVAL
-                    || transferred.saturating_sub(last_reported_bytes) >= PROGRESS_BYTES
-                {
-                    self.inner
-                        .db
-                        .set_download_progress(
-                            download_id,
-                            base_bytes.saturating_add(transferred),
-                            Some(&file.name),
-                        )
-                        .await?;
-                    last_report = Instant::now();
-                    last_reported_bytes = transferred;
-                }
-            }
-
-            if let Some(error) = interrupted {
-                if retryable(&error) && attempts + 1 < MAX_ATTEMPTS {
-                    warn!(
-                        file = %file.name,
-                        offset = transferred,
-                        error = %error,
-                        "download interrupted, resuming"
-                    );
-                    retry_delay(&error, attempts).await;
-                    attempts += 1;
-                    continue;
-                }
-                return Err(error.into());
-            }
-
-            break;
         }
 
-        output.flush().await?;
-        output.sync_all().await?;
-        drop(output);
+        let progress = Arc::new(AtomicU64::new(initial_bytes));
+        let report_state = Arc::new(tokio::sync::Mutex::new(ProgressReportState {
+            last_report: Instant::now(),
+            last_reported_bytes: initial_bytes,
+        }));
+        let db = self.inner.db.clone();
+        let file_id = file.id.clone();
+        let file_name_for_log = file.name.clone();
+        let progress_for_tasks = progress.clone();
+        let report_state_for_tasks = report_state.clone();
+        let parallel = self.inner.parallel_per_file;
 
+        let task = ChunkTask {
+            source,
+            file_id: &file_id,
+            cancel,
+            db: &db,
+            download_id,
+            base_bytes,
+            file_name: &file_name_for_log,
+            progress: &progress_for_tasks,
+            report_state: &report_state_for_tasks,
+        };
+        stream::iter(chunks.into_iter().map(|chunk| download_chunk(task, chunk)))
+            .buffer_unordered(parallel)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        if cancel.load(Ordering::SeqCst) {
+            return Err(DownloadError::Cancelled);
+        }
+
+        let transferred = progress.load(Ordering::SeqCst);
         if let Some(size) = file.size {
             if transferred != size {
                 return Err(failure(format!(
@@ -567,8 +562,98 @@ impl DownloadEngine {
             }
         }
 
-        replace_target(&part, &target).await?;
+        let merged_part = dir.join(format!(".{file_name}.merge.part"));
+        let mut output = tokio::fs::File::create(&merged_part).await?;
+        for index in 0..chunk_count {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(DownloadError::Cancelled);
+            }
+            let chunk_path = dir.join(chunk_file_name(&file_name, index));
+            let mut input = tokio::fs::File::open(&chunk_path).await?;
+            tokio::io::copy(&mut input, &mut output).await?;
+        }
+        output.flush().await?;
+        output.sync_all().await?;
+        drop(output);
+
+        replace_target(&merged_part, &target).await?;
+        for index in 0..chunk_count {
+            let chunk_path = dir.join(chunk_file_name(&file_name, index));
+            let _ = tokio::fs::remove_file(chunk_path).await;
+        }
+        let _ = tokio::fs::remove_file(legacy_part).await;
+        let _ = tokio::fs::remove_file(&meta_path).await;
+        self.inner
+            .db
+            .set_download_progress(
+                download_id,
+                base_bytes.saturating_add(transferred),
+                Some(&file.name),
+            )
+            .await?;
         Ok(transferred)
+    }
+
+    async fn migrate_legacy_partial(
+        &self,
+        legacy_part: &Path,
+        chunks: &[ChunkSpec],
+        file_size: Option<u64>,
+    ) -> DResult<()> {
+        let legacy_size = match tokio::fs::metadata(legacy_part).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if legacy_size == 0 {
+            return Ok(());
+        }
+        if let Some(size) = file_size {
+            if legacy_size > size {
+                tokio::fs::remove_file(legacy_part).await?;
+                return Ok(());
+            }
+        }
+
+        let mut input = tokio::fs::File::open(legacy_part).await?;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        for chunk in chunks {
+            if tokio::fs::try_exists(&chunk.path).await? {
+                continue;
+            }
+            let available = legacy_size.saturating_sub(chunk.start);
+            let to_copy = chunk
+                .expected_len
+                .map_or(available, |expected| available.min(expected));
+            if to_copy == 0 {
+                continue;
+            }
+            input.seek(SeekFrom::Start(chunk.start)).await?;
+            let temporary = chunk
+                .path
+                .with_extension(format!("part.{}.migrate", chunk.index));
+            let mut output = tokio::fs::File::create(&temporary).await?;
+            let mut remaining = to_copy;
+            while remaining > 0 {
+                let read_size = remaining.min(buffer.len() as u64) as usize;
+                let read = input.read(&mut buffer[..read_size]).await?;
+                if read == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..read]).await?;
+                remaining -= read as u64;
+            }
+            output.flush().await?;
+            output.sync_all().await?;
+            drop(output);
+            if !tokio::fs::try_exists(&chunk.path).await? {
+                tokio::fs::rename(&temporary, &chunk.path).await?;
+            } else {
+                let _ = tokio::fs::remove_file(&temporary).await;
+            }
+        }
+        tokio::fs::remove_file(legacy_part).await?;
+        Ok(())
     }
 
     async fn ensure_dir(&self, relative: &str) -> DResult<PathBuf> {
@@ -585,6 +670,182 @@ impl DownloadEngine {
             return Err(failure("下载路径超出下载根目录"));
         }
         Ok(canonical)
+    }
+}
+
+#[derive(Clone)]
+struct ChunkSpec {
+    index: usize,
+    start: u64,
+    end: Option<u64>,
+    expected_len: Option<u64>,
+    path: PathBuf,
+}
+
+struct ProgressReportState {
+    last_report: Instant,
+    last_reported_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ChunkTask<'a> {
+    source: &'a dyn FileSourceProvider,
+    file_id: &'a str,
+    cancel: &'a AtomicBool,
+    db: &'a Db,
+    download_id: &'a str,
+    base_bytes: u64,
+    file_name: &'a str,
+    progress: &'a Arc<AtomicU64>,
+    report_state: &'a Arc<tokio::sync::Mutex<ProgressReportState>>,
+}
+
+async fn download_chunk(task: ChunkTask<'_>, chunk: ChunkSpec) -> DResult<u64> {
+    let ChunkTask {
+        source,
+        file_id,
+        cancel,
+        db,
+        download_id,
+        base_bytes,
+        file_name,
+        progress,
+        report_state,
+    } = task;
+    let mut output = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&chunk.path)
+        .await?;
+    let mut transferred = output.metadata().await?.len();
+    if chunk.expected_len == Some(0) {
+        output.flush().await?;
+        return Ok(0);
+    }
+    if chunk
+        .expected_len
+        .is_some_and(|expected| transferred == expected)
+    {
+        output.sync_all().await?;
+        return Ok(transferred);
+    }
+
+    let mut attempts = 0_usize;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = output.flush().await;
+            return Err(DownloadError::Cancelled);
+        }
+
+        let request = DownloadFileRequest {
+            file_id: file_id.to_owned(),
+            range_start: if chunk.expected_len.is_some() || transferred > 0 {
+                Some(chunk.start.saturating_add(transferred))
+            } else {
+                None
+            },
+            range_end_inclusive: chunk.end,
+            expected_revision: None,
+        };
+        let mut body = match source.download_file(request).await {
+            Ok(body) => body,
+            Err(error) => {
+                if retryable(&error) && attempts + 1 < MAX_ATTEMPTS {
+                    retry_delay(&error, attempts).await;
+                    attempts += 1;
+                    continue;
+                }
+                return Err(error.into());
+            }
+        };
+
+        let mut interrupted = None;
+        while let Some(result) = body.next().await {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = output.flush().await;
+                return Err(DownloadError::Cancelled);
+            }
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    interrupted = Some(error);
+                    break;
+                }
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            let next = transferred.saturating_add(bytes.len() as u64);
+            if chunk.expected_len.is_some_and(|expected| next > expected) {
+                return Err(failure(format!(
+                    "分块 {} 返回的数据超过预期大小（{next} > {}）",
+                    chunk.index,
+                    chunk.expected_len.unwrap_or_default()
+                )));
+            }
+            output.write_all(&bytes).await?;
+            transferred = next;
+            progress.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            let mut state = report_state.lock().await;
+            let total = progress.load(Ordering::SeqCst);
+            if state.last_report.elapsed() >= PROGRESS_INTERVAL
+                || total.saturating_sub(state.last_reported_bytes) >= PROGRESS_BYTES
+            {
+                db.set_download_progress(
+                    download_id,
+                    base_bytes.saturating_add(total),
+                    Some(file_name),
+                )
+                .await?;
+                state.last_report = Instant::now();
+                state.last_reported_bytes = total;
+            }
+        }
+
+        output.flush().await?;
+        if let Some(error) = interrupted {
+            if retryable(&error) && attempts + 1 < MAX_ATTEMPTS {
+                warn!(
+                    file = %file_name,
+                    chunk = chunk.index,
+                    offset = transferred,
+                    error = %error,
+                    "download chunk interrupted, resuming"
+                );
+                retry_delay(&error, attempts).await;
+                attempts += 1;
+                continue;
+            }
+            return Err(error.into());
+        }
+
+        if chunk
+            .expected_len
+            .is_none_or(|expected| transferred == expected)
+        {
+            output.sync_all().await?;
+            return Ok(transferred);
+        }
+
+        let error = ProviderError::new(
+            ProviderErrorCategory::Network,
+            format!(
+                "分块 {} 提前结束：已下载 {transferred} 字节，预期 {} 字节",
+                chunk.index,
+                chunk.expected_len.unwrap_or_default()
+            ),
+        );
+        if attempts + 1 >= MAX_ATTEMPTS {
+            return Err(error.into());
+        }
+        warn!(
+            file = %file_name,
+            chunk = chunk.index,
+            offset = transferred,
+            "download chunk ended early, resuming"
+        );
+        retry_delay(&error, attempts).await;
+        attempts += 1;
     }
 }
 
@@ -676,6 +937,27 @@ async fn replace_target(part: &Path, target: &Path) -> DResult<()> {
         tokio::fs::remove_file(target).await?;
     }
     tokio::fs::rename(part, target).await?;
+    Ok(())
+}
+
+fn chunk_file_name(file_name: &str, index: usize) -> String {
+    format!(".{file_name}.part.{index}")
+}
+
+/// Remove per-chunk temporary files for a single target. Used when the chunk
+/// layout changed and the old partials can no longer be resumed safely.
+async fn remove_part_chunks(dir: &Path, file_name: &str) -> DResult<()> {
+    let prefix = format!(".{file_name}.part.");
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit()) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
     Ok(())
 }
 
@@ -797,7 +1079,7 @@ fn available_child_path(dir: &Path, name: &str, fallback_id: &str) -> PathBuf {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use quark_core::domain::{ProviderResult, RemoteFilePage};
+    use quark_core::domain::{ProviderByteStream, ProviderResult, RemoteFilePage};
 
     #[test]
     fn relative_dirs_reject_traversal() {
@@ -817,8 +1099,11 @@ mod tests {
         assert_eq!(safe_local_name(".env", "x"), ".env");
     }
 
+    type RangeLog = Arc<StdMutex<Vec<(Option<u64>, Option<u64>)>>>;
+
     struct FakeSource {
         payload: Vec<u8>,
+        requests: RangeLog,
     }
 
     #[async_trait]
@@ -835,8 +1120,17 @@ mod tests {
             &self,
             request: DownloadFileRequest,
         ) -> ProviderResult<ProviderByteStream> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.range_start, request.range_end_inclusive));
             let start = request.range_start.unwrap_or(0) as usize;
-            let bytes = self.payload[start.min(self.payload.len())..].to_vec();
+            let end = request
+                .range_end_inclusive
+                .map(|end| (end as usize + 1).min(self.payload.len()))
+                .unwrap_or(self.payload.len());
+            let start = start.min(end).min(self.payload.len());
+            let bytes = self.payload[start..end].to_vec();
             Ok(Box::pin(futures_util::stream::iter(vec![Ok(bytes)])))
         }
     }
@@ -863,15 +1157,29 @@ mod tests {
         let db = Db::open(&dir.join("test.db")).await.unwrap();
         let vault = Arc::new(Vault::from_key([7_u8; 32]));
         let factory = Arc::new(quark_core::QuarkDriveFactory::new().unwrap());
-        let engine = DownloadEngine::start(db, vault, factory, dir.clone(), dir.clone(), 1);
+        let engine = DownloadEngine::start(
+            db,
+            vault,
+            factory,
+            dir.clone(),
+            dir.clone(),
+            DownloadTuning {
+                concurrency: 1,
+                chunk_size: 100_000,
+                parallel_per_file: 2,
+            },
+        );
 
-        let payload = b"hello quark drive resume test".to_vec();
-        let split = 11;
+        let payload = (0..200_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let split = 70_000;
         let part = dir.join(".hello.txt.part");
         tokio::fs::write(&part, &payload[..split]).await.unwrap();
 
         let source = FakeSource {
             payload: payload.clone(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
         };
         let file = fake_file("file-1", payload.len() as u64);
         let cancel = AtomicBool::new(false);
@@ -886,6 +1194,75 @@ mod tests {
             payload
         );
         assert!(!part.exists());
+        assert_eq!(source.requests.lock().unwrap().len(), 2);
+        assert!(source
+            .requests
+            .lock()
+            .unwrap()
+            .contains(&(Some(70_000), Some(99_999))));
+        assert!(source
+            .requests
+            .lock()
+            .unwrap()
+            .contains(&(Some(100_000), Some(199_999))));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn discards_partials_when_chunk_layout_changed() {
+        let dir = std::env::temp_dir().join(format!("quark-dl-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let db = Db::open(&dir.join("test.db")).await.unwrap();
+        let vault = Arc::new(Vault::from_key([7_u8; 32]));
+        let factory = Arc::new(quark_core::QuarkDriveFactory::new().unwrap());
+        let engine = DownloadEngine::start(
+            db,
+            vault,
+            factory,
+            dir.clone(),
+            dir.clone(),
+            DownloadTuning {
+                concurrency: 1,
+                chunk_size: 100_000,
+                parallel_per_file: 2,
+            },
+        );
+
+        let payload = (0..200_000)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        // Leftovers from a previous run with a 50_000-byte chunk size. Reusing
+        // them with the new layout would corrupt the merged output.
+        tokio::fs::write(dir.join(".hello.txt.part.meta"), "50000\t200000")
+            .await
+            .unwrap();
+        for index in 0..4 {
+            tokio::fs::write(
+                dir.join(format!(".hello.txt.part.{index}")),
+                vec![0xFF_u8; 50_000],
+            )
+            .await
+            .unwrap();
+        }
+
+        let source = FakeSource {
+            payload: payload.clone(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let file = fake_file("file-1", payload.len() as u64);
+        let cancel = AtomicBool::new(false);
+        let written = engine
+            .transfer_file(&source, &file, &dir, &cancel, "download-1", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(
+            tokio::fs::read(dir.join("hello.txt")).await.unwrap(),
+            payload
+        );
+        assert!(!dir.join(".hello.txt.part.meta").exists());
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::download::DownloadEngine;
+use crate::download::{DownloadEngine, DownloadTuning};
 use crate::state::AppState;
 use crate::vault::Vault;
 
@@ -48,7 +48,11 @@ async fn main() -> anyhow::Result<()> {
         factory.clone(),
         paths.download_root.clone(),
         paths.download_root.clone(),
-        paths.concurrency,
+        DownloadTuning {
+            concurrency: paths.concurrency,
+            chunk_size: paths.chunk_size as u64,
+            parallel_per_file: paths.parallel_per_file,
+        },
     );
 
     for row in db.list_downloads(10_000).await? {

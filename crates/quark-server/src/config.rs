@@ -35,9 +35,20 @@ pub struct Config {
     #[arg(long, env = "QUARK_ALLOW_INSECURE", default_value_t = false)]
     pub allow_insecure: bool,
 
-    /// Number of concurrent download workers.
+    /// Number of concurrent download workers (different files/folders).
     #[arg(long, env = "QUARK_CONCURRENCY", default_value_t = 1)]
     pub concurrency: usize,
+
+    /// Byte size of each download chunk for parallel per-file download.
+    /// Smaller chunks increase parallelism but add API overhead.
+    #[arg(long, env = "QUARK_CHUNK_SIZE", default_value_t = 4 * 1024 * 1024)]
+    pub chunk_size: usize,
+
+    /// Maximum concurrent HTTP connections used to download a single file.
+    /// Quark's CDN throttles per-connection bandwidth, so parallel connections
+    /// per file are needed to reach full throughput.
+    #[arg(long, env = "QUARK_PARALLEL_PER_FILE", default_value_t = 8)]
+    pub parallel_per_file: usize,
 }
 
 impl Config {
@@ -74,6 +85,8 @@ impl Config {
             download_root,
             token,
             concurrency: self.concurrency.clamp(1, 8),
+            chunk_size: self.chunk_size.clamp(64 * 1024, 64 * 1024 * 1024),
+            parallel_per_file: self.parallel_per_file.clamp(1, 32),
         })
     }
 }
@@ -83,6 +96,8 @@ pub struct PreparedPaths {
     pub download_root: PathBuf,
     pub token: Option<String>,
     pub concurrency: usize,
+    pub chunk_size: usize,
+    pub parallel_per_file: usize,
 }
 
 fn canonicalize(path: &Path) -> anyhow::Result<PathBuf> {

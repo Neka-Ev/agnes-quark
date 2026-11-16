@@ -388,12 +388,10 @@ async fn create_download(
                 return Err(ApiError::bad_request("folder_id 不是文件夹"));
             }
             let name = safe_local_name(&folder.name, &folder.id);
-            let relative = if base.is_empty() {
-                name
-            } else {
-                format!("{base}/{name}")
-            };
-            ("folder", folder.id, folder.name, relative, None)
+            // The selected folder is the local download root.  Do not retain
+            // the user's current remote browsing path (for example
+            // `root/layer1`) above it.
+            ("folder", folder.id, folder.name, name, None)
         } else {
             let file_id = file_id.expect("validated above");
             let file = source.get_file(&file_id).await?;

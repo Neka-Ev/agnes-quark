@@ -1,0 +1,21 @@
+[Unit]
+Description=Quark Drive headless download server (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=QUARK_LISTEN=127.0.0.1:8787
+Environment=QUARK_DATA_DIR=%h/.local/share/quark-drive
+Environment=QUARK_DOWNLOAD_ROOT=%h/Downloads/quark-drive
+EnvironmentFile=-%h/.config/quark-drive.env
+ExecStart=%h/.local/bin/quark-server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
